@@ -7,16 +7,38 @@ import type { Register } from 'claude-code'
 // paragraph is heard. The first paragraph of a reply has a speed button on its
 // right. When a reply finishes, its audio is made in the background, so a
 // press plays at once. The speech work is done by scripts/read_aloud.py.
+//
+// Setup is automatic: the first press (or /read-aloud setup) installs the
+// speech packages into a private Python environment. Only Python is needed.
 
 const SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2]
-const PYTHON_CANDIDATES = ['python3', 'python', 'py']
+// Usual names, then the usual places on macOS, where an app started from the
+// Finder does not see the shell's PATH.
+const PYTHON_CANDIDATES = [
+  'python3',
+  'python',
+  'py',
+  '/opt/homebrew/bin/python3',
+  '/usr/local/bin/python3',
+  '/usr/bin/python3',
+]
+const NO_PYTHON =
+  'Read aloud needs Python 3.9 or newer. Install it from python.org, then restart Claude Code.'
+const SETUP_POLL_MS = 3000
+const SETUP_MAX_POLLS = 300 // 15 minutes
 
 // Which paragraph is heard now (its button key), and the speed last set.
 const playing = { plugin: 'claude-read-aloud', key: 'playing' } as const
 const speedRef = { plugin: 'claude-read-aloud', key: 'speed' } as const
 
 type Para = { text: string; speakable: boolean }
-type Paths = { now: string; speed: string }
+type Report = {
+  now: string
+  speed: string
+  ready: boolean
+  python: string | null
+  problem: string | null
+}
 
 /** 1.25 -> "1.25×" */
 const speedLabel = (s: number) => `${s}×`
@@ -55,49 +77,61 @@ function paragraphs(md: string): Para[] {
   return out
 }
 
+function parseReport(stdout: string): Report | undefined {
+  try {
+    const r = JSON.parse(stdout) as Report
+    return typeof r.now === 'string' ? r : undefined
+  } catch {
+    return undefined
+  }
+}
+
 const HELP = [
   'claude-read-aloud: press 🔊 beside a paragraph to hear the reply from there.',
   '',
+  '/read-aloud setup         one-time setup (also starts on the first 🔊 press)',
   '/read-aloud stop          stop reading',
-  '/read-aloud speed 1.25    playback speed, 0.5 to 2',
+  '/read-aloud speed 1.25    speaking speed, 0.5 to 2',
   '/read-aloud voice <name>  a Piper voice (en_US-ryan-medium) or an edge-tts voice (en-US-AvaNeural); "auto" picks by language',
   '/read-aloud auto on|off   read every reply aloud automatically',
-  '/read-aloud doctor        check Python, Piper, edge-tts and FFmpeg',
+  '/read-aloud doctor        show what was found and what is missing',
 ].join('\n')
 
 export const register: Register = on => {
-  // Found at session start (and again after a reload): the Python that runs
-  // the script, and the state files the buttons read.
-  let python: string | undefined
-  let paths: Paths | undefined
-  // The poller following the background reader (one at a time).
+  // Found at session start (and again after a reload):
+  //   bootstrap: a Python that runs the script (standard library only)
+  //   report:    the script's --paths answer: state files, readiness, and
+  //              `python`, the interpreter with the speech packages
+  let bootstrap: string | undefined
+  let report: Report | undefined
+  // The pollers: one follows the paragraph being heard, one waits for setup.
   let tick: { cancel: () => void } | undefined
+  let setupTick: { cancel: () => void } | undefined
 
-  const ready = () => Boolean(python && paths)
-  const NOT_READY = [
-    'Read aloud is not ready: no Python found that runs the plugin.',
-    'Install Python 3.9+, then: pip install piper-tts edge-tts',
-    'Install FFmpeg (ffplay) and put it on PATH, then restart Claude Code.',
-    'If Python has another name, set CLAUDE_READ_ALOUD_PYTHON to its full path.',
-  ].join('\n')
+  const runner = () => (report?.ready && report.python ? report.python : undefined)
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'read-aloud',
-      description: 'Read-aloud for replies: stop, speed, voice, auto, doctor',
-      argumentHint: '[stop | speed <0.5-2> | voice <name|auto> | auto on|off | doctor]',
+      description: 'Read-aloud for replies: setup, stop, speed, voice, auto, doctor',
+      argumentHint: '[setup | stop | speed <0.5-2> | voice <name|auto> | auto on|off | doctor]',
     })
     const script = `${$.plugin.root}/scripts/read_aloud.py`
-    // Find a Python that runs the script: CLAUDE_READ_ALOUD_PYTHON if set,
-    // else the usual names. In the background, so the session starts at once.
+    // In the background, so the session starts at once.
     void (async () => {
       const fromEnv = await $.env.get('CLAUDE_READ_ALOUD_PYTHON')
       for (const candidate of fromEnv ? [fromEnv] : PYTHON_CANDIDATES) {
         try {
           const r = await $.process.run([candidate, script, '--paths'], { timeoutMs: 8000 })
-          if (r.exitCode === 0 && r.stdout.trim().startsWith('{')) {
-            paths = JSON.parse(r.stdout) as Paths
-            python = candidate
+          const parsed = r.exitCode === 0 ? parseReport(r.stdout.trim()) : undefined
+          if (parsed) {
+            bootstrap = candidate
+            report = parsed
+            // Start loading the voice server now, so the first press is quick.
+            const python = runner()
+            if (python) {
+              await $.process.run([python, script, '--warm'], { timeoutMs: 8000 }).catch(() => undefined)
+            }
             return
           }
         } catch {
@@ -111,6 +145,7 @@ export const register: Register = on => {
   // When a reply is finished, make its audio in the background (and read it
   // aloud if auto-read is on). The script returns at once.
   on('classic.Stop', async ($, e, next) => {
+    const python = runner()
     if (python) {
       try {
         await $.process.run([python, `${$.plugin.root}/scripts/read_aloud.py`], {
@@ -125,19 +160,38 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'read-aloud' }, async ($, e) => {
-    if (!python) return { text: NOT_READY }
+    if (!bootstrap) return { text: NO_PYTHON }
     const script = `${$.plugin.root}/scripts/read_aloud.py`
     const [sub = '', ...rest] = e.args.trim().split(/\s+/)
     const arg = rest.join(' ')
-    const run = async (args: string[]) => {
+    // Settings and checks run with the bootstrap Python; reading needs the runner.
+    const run = async (args: string[], python = bootstrap ?? 'python') => {
       try {
-        const r = await $.process.run([python ?? 'python', script, ...args], { timeoutMs: 30000 })
+        const r = await $.process.run([python, script, ...args], { timeoutMs: 30000 })
         return (r.stdout || r.stderr).trim()
       } catch (err) {
         return `Failed: ${String(err)}`
       }
     }
+    const refresh = async () => {
+      const parsed = parseReport(await run(['--paths']))
+      if (parsed) report = parsed
+    }
     switch (sub.toLowerCase()) {
+      case 'setup': {
+        const out = await run(['--setup'])
+        setupTick?.cancel()
+        let polls = 0
+        setupTick = $.clock.every(SETUP_POLL_MS, async () => {
+          await refresh()
+          if (report?.ready || ++polls > SETUP_MAX_POLLS || /failed/i.test(report?.problem ?? '')) {
+            setupTick?.cancel()
+            setupTick = undefined
+            $.ui.toast(report?.ready ? 'Read aloud is ready: press 🔊' : (report?.problem ?? 'Setup stopped'))
+          }
+        })
+        return { text: out }
+      }
       case 'stop':
         tick?.cancel()
         tick = undefined
@@ -148,18 +202,19 @@ export const register: Register = on => {
         const n = Number(out)
         if (!Number.isFinite(n)) return { text: out }
         await $.state.set(speedRef, n)
-        return { text: `Playback speed: ${n}×` }
+        return { text: `Speaking speed: ${n}×` }
       }
       case 'voice':
         return { text: await run(['--voice', arg || 'auto']) }
       case 'auto':
         return { text: `Auto-read: ${await run(arg ? ['--auto', arg] : ['--auto'])}` }
       case 'doctor': {
-        const out = await run(['--doctor'])
+        await refresh()
+        const out = await run(['--doctor'], runner() ?? bootstrap)
         try {
-          const report = JSON.parse(out) as Record<string, unknown>
-          const lines = Object.entries(report).map(([k, v]) => `${k}: ${JSON.stringify(v)}`)
-          return { text: [`Python command: ${python}`, ...lines].join('\n') }
+          const found = JSON.parse(out) as Record<string, unknown>
+          const lines = Object.entries(found).map(([k, v]) => `${k}: ${JSON.stringify(v)}`)
+          return { text: [`python command: ${bootstrap}`, ...lines].join('\n') }
         } catch {
           return { text: out }
         }
@@ -175,7 +230,6 @@ export const register: Register = on => {
     }
 
     const script = `${$.plugin.root}/scripts/read_aloud.py`
-
     const { Box, Button, Markdown } = $.ui.resolve(e)
     const { value: now = null } = await $.state.get(playing)
     const paras = paragraphs(e.props.text)
@@ -186,9 +240,9 @@ export const register: Register = on => {
       const { value } = await $.state.get(speedRef)
       if (typeof value === 'number') {
         speed = value
-      } else if (paths) {
+      } else if (report) {
         try {
-          const text = await $.fs.read(paths.speed)
+          const text = await $.fs.read(report.speed)
           const n = typeof text === 'string' ? parseFloat(text) : NaN
           if (Number.isFinite(n)) speed = n
         } catch {
@@ -197,11 +251,50 @@ export const register: Register = on => {
       }
     }
 
+    // Not set up yet: start the one-time setup and say what is happening;
+    // a toast says when it is ready. True when reading can start now.
+    const ensureReady = async (): Promise<boolean> => {
+      if (runner()) return true
+      if (!bootstrap) {
+        $.ui.toast(NO_PYTHON)
+        return false
+      }
+      let out = ''
+      try {
+        const r = await $.process.run([bootstrap, script, '--setup'], { timeoutMs: 8000 })
+        out = r.stdout.trim()
+      } catch {
+        out = 'Read aloud: could not start the setup. Run /read-aloud doctor.'
+      }
+      $.ui.toast(out || 'Setting up read-aloud...')
+      if (!setupTick) {
+        let polls = 0
+        const python = bootstrap
+        setupTick = $.clock.every(SETUP_POLL_MS, async () => {
+          try {
+            const r = await $.process.run([python, script, '--paths'], { timeoutMs: 8000 })
+            const parsed = parseReport(r.stdout.trim())
+            if (parsed) report = parsed
+          } catch {
+            // try again next time
+          }
+          const failed = /failed/i.test(report?.problem ?? '')
+          if (report?.ready || failed || ++polls > SETUP_MAX_POLLS) {
+            setupTick?.cancel()
+            setupTick = undefined
+            $.ui.toast(report?.ready ? 'Read aloud is ready: press 🔊' : (report?.problem ?? 'Setup stopped'))
+          }
+        })
+      }
+      return false
+    }
+
     const stop = async () => {
       tick?.cancel()
       tick = undefined
       await $.state.set(playing, null)
-      if (!ready() || !python) return
+      const python = runner()
+      if (!python) return
       try {
         await $.process.run([python, script, '--stop'], { timeoutMs: 8000 })
       } catch {
@@ -210,11 +303,10 @@ export const register: Register = on => {
     }
 
     const startFrom = async (start: number) => {
-      if (!ready() || !python || !paths) {
-        $.ui.toast('Read aloud is not ready: run /read-aloud for setup help')
-        return
-      }
-      const nowFile = paths.now
+      if (!(await ensureReady())) return
+      const python = runner()
+      if (!python || !report) return
+      const nowFile = report.now
       const key = `${e.requestId}-${start}`
       // Every speakable paragraph of the block (the voice is picked from all
       // of them, as the prefetch did), and where in that list to start.
@@ -230,7 +322,7 @@ export const register: Register = on => {
           timeoutMs: 8000,
         })
       } catch {
-        $.ui.toast('Read aloud: could not start')
+        $.ui.toast('Read aloud: could not start. Run /read-aloud doctor.')
         await $.state.set(playing, null)
         return
       }
@@ -268,8 +360,9 @@ export const register: Register = on => {
     // Next speed; if this block is being read, go on at the new speed from
     // the paragraph being heard.
     const cycleSpeed = async () => {
-      if (!ready() || !python) {
-        $.ui.toast('Read aloud is not ready: run /read-aloud for setup help')
+      const python = runner() ?? bootstrap
+      if (!python) {
+        $.ui.toast(NO_PYTHON)
         return
       }
       const at = SPEEDS.findIndex(s => Math.abs(s - speed) < 0.01)

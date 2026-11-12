@@ -2,24 +2,33 @@
 
 Called by the plugin's hooks module (hooks/register.tsx). Speech comes from
 Piper (local, offline, fast) with edge-tts (Microsoft online voices) as the
-fallback or as an opt-in voice. Audio is played by ffplay (part of FFmpeg).
+fallback or as an opt-in voice. Audio is played with miniaudio (no FFmpeg
+needed); ffplay is used only if miniaudio is missing.
 
-Modes (all print one line or JSON and exit quickly unless noted):
+This file runs with only the standard library until speech is needed, so
+any Python 3.9+ can run --paths, --setup and --doctor. --setup makes a
+private virtual environment with the speech packages; the hooks module then
+runs everything else with that environment's Python.
+
+Modes (each prints one line or JSON and returns quickly unless noted):
   (none)              Stop-hook mode: stdin is the hook JSON; prefetches the
                       reply's audio and, if auto-read is on, reads it aloud
   --say-from          stdin JSON {"items":[{key,text}], "start": n}: read the
                       items from n to the end, back to back (returns at once)
   --stop              stop reading
-  --speed [n]         set (0.5-2) or print the playback speed
+  --speed [n]         set (0.5-2) or print the speaking speed
   --voice [name]      set a voice (Piper name, edge-tts *Neural name, "auto")
   --auto [on|off]     auto-read every reply on/off (default off)
+  --setup             install the speech packages into a private venv
+                      (runs in the background; --paths reports progress)
   --doctor            JSON report of what is installed and working
-  --paths             JSON of the state files the hooks module reads
-Internal: --sequence <file>, --prefetch <file>
+  --paths             JSON: state files, the Python to use, readiness
+Internal: --sequence <file>, --prefetch <file>, --setup-worker
 
 State lives in ~/.claude/read-aloud/.
 """
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -38,7 +47,7 @@ HERE = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / ".claude" / "read-aloud"
 AUTO_FILE = STATE_DIR / "auto"            # exists -> every reply is read aloud
 VOICE_FILE = STATE_DIR / "voice.txt"      # fixed voice; absent -> by language
-SPEED_FILE = STATE_DIR / "speed.txt"      # playback speed 0.5-2
+SPEED_FILE = STATE_DIR / "speed.txt"      # speaking speed 0.5-2
 PID_FILE = STATE_DIR / "player.pid"
 SEQ_PID_FILE = STATE_DIR / "sequence.pid"
 NOW_FILE = STATE_DIR / "now.txt"          # key of the paragraph being heard
@@ -47,13 +56,19 @@ DEBUG_FILE = STATE_DIR / "debug"          # exists -> log playback timing
 CACHE_DIR = STATE_DIR / "cache"
 INDEX_FILE = STATE_DIR / "cache_index.json"
 VOICE_DIR = STATE_DIR / "piper-voices"
+VENV_DIR = STATE_DIR / "venv"
+VENV_READY = VENV_DIR / ".ready"          # written once the packages installed
+SETUP_STATUS = STATE_DIR / "setup.json"   # {"state": running|done|failed, ...}
+SETUP_LOG = STATE_DIR / "setup-log.txt"
 
+PACKAGES = ["piper-tts>=1.3", "edge-tts>=7.0", "miniaudio>=1.59"]
 KEEP_REPLIES = 2          # audio kept for the latest N replies
 MAX_CHARS = 3500          # longest text spoken per paragraph
 PREFETCH_THREADS = 8      # parallel edge-tts requests (Piper runs one at a time)
 SAMPLE_RATE = 22050       # Piper voices; edge-tts audio is resampled to it
-PLAYER_LATENCY = 0.25
+BYTES_PER_SEC = SAMPLE_RATE * 2
 SILENCE_BETWEEN = b"\x00\x00" * int(SAMPLE_RATE * 0.35)
+MUTED = bool(os.environ.get("CLAUDE_READ_ALOUD_MUTE"))  # silent playback for tests
 
 PIPER_PORT = int(os.environ.get("CLAUDE_READ_ALOUD_PORT", "59125"))
 PIPER_SERVER = HERE / "piper_server.py"
@@ -72,8 +87,6 @@ EDGE_VOICES = {
 
 NO_WINDOW = 0x08000000
 DETACHED = 0x00000008 | 0x00000200 | NO_WINDOW
-ABOVE_NORMAL = 0x00008000
-BELOW_NORMAL = 0x00004000
 
 
 def log(msg):
@@ -93,18 +106,21 @@ def unlink(*paths):
             pass
 
 
+def has_module(name):
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
 # ---------- processes (Windows and POSIX) ----------
 
-def popen(args, detached=False, priority=None, **kw):
+def popen(args, detached=False, **kw):
     if IS_WIN:
-        flags = (DETACHED if detached else NO_WINDOW) | (priority or 0)
-        return subprocess.Popen(args, creationflags=flags, **kw)
+        return subprocess.Popen(args, creationflags=DETACHED if detached else NO_WINDOW, **kw)
     if detached:
         kw["start_new_session"] = True
-    proc = subprocess.Popen(args, **kw)
-    if priority == ABOVE_NORMAL:
-        pass  # raising priority needs privileges on POSIX
-    return proc
+    return subprocess.Popen(args, **kw)
 
 
 def python_for_background():
@@ -137,14 +153,92 @@ def kill_from(pid_file):
     unlink(pid_file)
 
 
-def spawn(mode, payload):
-    """Run this script detached in `mode` with a JSON payload; returns at once."""
-    fd, tmp = tempfile.mkstemp(prefix="claude_read_aloud_", suffix=".json")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-    popen([python_for_background(), str(Path(__file__).resolve()), mode, tmp], detached=True,
-          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-          close_fds=True)
+def spawn(mode, payload=None):
+    """Run this script detached in `mode` (with a JSON payload); returns at once."""
+    args = [python_for_background(), str(Path(__file__).resolve()), mode]
+    if payload is not None:
+        fd, tmp = tempfile.mkstemp(prefix="claude_read_aloud_", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        args.append(tmp)
+    popen(args, detached=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL, close_fds=True)
+
+
+# ---------- setup: a private venv with the speech packages ----------
+
+def venv_python():
+    if IS_WIN:
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python3"
+
+
+def read_setup_status():
+    try:
+        return json.loads(SETUP_STATUS.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def setup_running():
+    st = read_setup_status()
+    return st.get("state") == "running" and time.time() - st.get("since", 0) < 900
+
+
+def start_setup():
+    if VENV_READY.exists() and venv_python().exists():
+        return "ready"
+    if setup_running():
+        return "running"
+    SETUP_STATUS.write_text(json.dumps({"state": "running", "since": time.time()}), encoding="utf-8")
+    spawn("--setup-worker")
+    return "started"
+
+
+def setup_worker():
+    """Make the venv and pip-install the packages; record how it went."""
+    def fail(msg):
+        SETUP_STATUS.write_text(json.dumps({"state": "failed", "error": msg}), encoding="utf-8")
+        log(f"setup failed: {msg}")
+
+    kw = {"creationflags": NO_WINDOW} if IS_WIN else {}
+    with open(SETUP_LOG, "w", encoding="utf-8") as out:
+        try:
+            if not venv_python().exists():
+                r = subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)],
+                                   stdout=out, stderr=subprocess.STDOUT, **kw)
+                if r.returncode != 0 or not venv_python().exists():
+                    return fail("could not create a virtual environment "
+                                "(on Debian/Ubuntu: sudo apt install python3-venv)")
+            r = subprocess.run([str(venv_python()), "-m", "pip", "install",
+                                "--disable-pip-version-check", *PACKAGES],
+                               stdout=out, stderr=subprocess.STDOUT, **kw)
+            if r.returncode != 0:
+                return fail(f"pip install failed, see {SETUP_LOG}")
+        except Exception as e:
+            return fail(repr(e))
+    VENV_READY.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
+    SETUP_STATUS.write_text(json.dumps({"state": "done"}), encoding="utf-8")
+
+
+def paths_report():
+    """What the hooks module needs: which Python to run, and whether it can."""
+    report = {"now": str(NOW_FILE), "speed": str(SPEED_FILE)}
+    if VENV_READY.exists() and venv_python().exists():
+        report.update(ready=True, python=str(venv_python()), problem=None)
+    elif has_module("piper") and (has_module("miniaudio") or find_tool("ffplay")):
+        report.update(ready=True, python=sys.executable, problem=None)  # installed by hand
+    else:
+        st = read_setup_status()
+        if setup_running():
+            problem = "Setting up read-aloud (one time, 1-2 minutes)..."
+        elif st.get("state") == "failed":
+            problem = f"Setup failed: {st.get('error')}. Try /read-aloud setup again."
+        else:
+            problem = "Read-aloud needs a one-time setup. Press 🔊 or run /read-aloud setup."
+        report.update(ready=False, python=None, problem=problem,
+                      setup=st.get("state", "not started"))
+    return report
 
 
 # ---------- settings ----------
@@ -183,8 +277,7 @@ def pick_voice(text):
 
 
 def edge_fallback(voice):
-    lang = voice[:2].lower()
-    return EDGE_VOICES.get(lang, EDGE_VOICES["en"])
+    return EDGE_VOICES.get(voice[:2].lower(), EDGE_VOICES["en"])
 
 
 # ---------- reading the transcript ----------
@@ -287,10 +380,10 @@ def block_items(block_texts):
     return texts, pick_voice(" ".join(texts))
 
 
-# ---------- making audio ----------
+# ---------- making audio (speed is part of the audio, so it keeps its pitch) ----------
 
-def cache_path(text, voice):
-    h = hashlib.sha1(f"{voice}\n{text}".encode("utf-8")).hexdigest()[:24]
+def cache_path(text, voice, speed):
+    h = hashlib.sha1(f"{voice}\n{speed:g}\n{text}".encode("utf-8")).hexdigest()[:24]
     return CACHE_DIR / f"{h}.{'wav' if is_piper(voice) else 'mp3'}"
 
 
@@ -306,11 +399,14 @@ def wait_for_inflight(path, timeout=25):
     return path.exists()
 
 
-def _ping():
+def _opener():
     import urllib.request
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _ping():
     try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(f"http://127.0.0.1:{PIPER_PORT}/ping", timeout=0.5) as r:
+        with _opener().open(f"http://127.0.0.1:{PIPER_PORT}/ping", timeout=0.5) as r:
             return r.read() == b"ok"
     except Exception:
         return False
@@ -340,41 +436,41 @@ def ensure_piper_server(timeout=60):
     return False
 
 
-def piper_synth(text, voice, out_path):
+def piper_synth(text, voice, speed, out_path):
     import urllib.request
     if not ensure_piper_server():
-        raise RuntimeError("the Piper server did not start (see --doctor)")
+        raise RuntimeError("the Piper server did not start (see /read-aloud doctor)")
     req = urllib.request.Request(
         f"http://127.0.0.1:{PIPER_PORT}/synth",
-        data=json.dumps({"text": text, "voice": voice}).encode("utf-8"),
+        data=json.dumps({"text": text, "voice": voice, "speed": speed}).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=300) as r:  # first use may download the voice
+    with _opener().open(req, timeout=300) as r:  # first use may download the voice
         Path(out_path).write_bytes(r.read())
 
 
-def synth_to(text, voice, path):
+def edge_synth(text, voice, speed, out_path):
+    import asyncio
+    import edge_tts  # slow import (~2 s): only when edge-tts is really used
+    rate = f"{round((speed - 1) * 100):+d}%"
+    asyncio.run(edge_tts.Communicate(text, voice, rate=rate).save(str(out_path)))
+
+
+def synth_to(text, voice, speed, path):
     """Make one paragraph's audio; written aside, then renamed into place."""
     if path.exists() or wait_for_inflight(path):
         return path
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     part = path.with_suffix(f".{os.getpid()}.{time.monotonic_ns()}.part")
-
-    def edge(v):
-        import asyncio
-        import edge_tts  # slow import (~2 s): only when edge-tts is really used
-        asyncio.run(edge_tts.Communicate(text, v).save(str(part)))
-
     try:
         if is_piper(voice):
             try:
-                piper_synth(text, voice, part)
+                piper_synth(text, voice, speed, part)
             except Exception as e:
                 log(f"piper failed, using edge-tts: {e!r}")
-                edge(edge_fallback(voice))
+                edge_synth(text, edge_fallback(voice), speed, part)
         else:
-            edge(voice)
+            edge_synth(text, voice, speed, part)
         try:
             part.replace(path)
         except PermissionError:
@@ -414,14 +510,15 @@ def prefetch_worker(job_file):
     job = json.loads(Path(job_file).read_text(encoding="utf-8"))
     os.remove(job_file)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    speed = get_speed()
     work = []
     for block in reversed(job["blocks"]):  # the final answer first
         texts, voice = block_items([t for t, ok in paragraphs(block) if ok])
-        work += [(t, voice, cache_path(t, voice)) for t in texts]
+        work += [(t, voice, cache_path(t, voice, speed)) for t in texts]
     remember_reply(job["id"], sorted({p.name for _, _, p in work}))
     threads = 1 if all(is_piper(v) for _, v, _ in work) else PREFETCH_THREADS
     with ThreadPoolExecutor(max_workers=threads) as pool:
-        for fut in [pool.submit(synth_to, t, v, p) for t, v, p in work]:
+        for fut in [pool.submit(synth_to, t, v, speed, p) for t, v, p in work]:
             try:
                 fut.result()
             except Exception as e:
@@ -431,17 +528,14 @@ def prefetch_worker(job_file):
 # ---------- playback ----------
 
 def find_tool(name):
-    return shutil.which(name) or shutil.which(name + ".exe")
-
-
-def ffplay_cmd(speed):
-    ffplay = find_tool("ffplay")
-    if not ffplay:
-        raise RuntimeError("ffplay not found: install FFmpeg and put it on PATH")
-    tempo = ["-af", f"atempo={speed:g}"] if abs(speed - 1.0) > 0.01 else []
-    mute = ["-volume", "0"] if os.environ.get("CLAUDE_READ_ALOUD_MUTE") else []  # silent tests
-    return [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", *mute,
-            "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ch_layout", "mono", *tempo, "-i", "pipe:0"]
+    found = shutil.which(name) or shutil.which(name + ".exe")
+    if found:
+        return found
+    for folder in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"):  # macOS GUI apps
+        candidate = Path(folder) / name
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 def pcm_of(path):
@@ -453,14 +547,115 @@ def pcm_of(path):
                 return w.readframes(w.getnframes())
     except (wave.Error, EOFError):
         pass
+    if has_module("miniaudio"):  # mp3 from edge-tts
+        import miniaudio
+        decoded = miniaudio.decode_file(str(path), output_format=miniaudio.SampleFormat.SIGNED16,
+                                        nchannels=1, sample_rate=SAMPLE_RATE)
+        return decoded.samples.tobytes()
     ffmpeg = find_tool("ffmpeg")
     if not ffmpeg:
-        raise RuntimeError("ffmpeg not found: install FFmpeg and put it on PATH")
+        raise RuntimeError("cannot decode mp3: run /read-aloud setup")
     kw = {"creationflags": NO_WINDOW} if IS_WIN else {}
     out = subprocess.run([ffmpeg, "-loglevel", "quiet", "-i", str(path), "-f", "s16le",
                           "-ar", str(SAMPLE_RATE), "-ac", "1", "-"],
                          capture_output=True, check=True, **kw)
     return out.stdout
+
+
+class MiniaudioPlayer:
+    """One open output stream fed paragraph after paragraph: no gaps, and it
+    knows exactly how much has been heard."""
+
+    def __init__(self):
+        import miniaudio
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self.written = 0
+        self.played = 0
+        self._device = miniaudio.PlaybackDevice(
+            output_format=miniaudio.SampleFormat.SIGNED16, nchannels=1,
+            sample_rate=SAMPLE_RATE, buffersize_msec=100)
+        gen = self._feed()
+        next(gen)
+        self._device.start(gen)
+
+    def _feed(self):
+        frames = yield b""
+        while True:
+            want = frames * 2
+            with self._lock:
+                chunk = bytes(self._buf[:want])
+                del self._buf[:want]
+                self.played += len(chunk)
+            if MUTED:
+                chunk = b"\x00" * len(chunk)
+            frames = yield chunk + b"\x00" * (want - len(chunk))
+
+    def write(self, pcm):
+        with self._lock:
+            self._buf += pcm
+            self.written += len(pcm)
+
+    def position(self):
+        return self.played
+
+    def drain(self):
+        while self.played < self.written:
+            time.sleep(0.05)
+        time.sleep(0.25)  # the device's own buffer
+
+    def close(self):
+        try:
+            self._device.close()
+        except Exception:
+            pass
+
+
+class FfplayPlayer:
+    """Fallback when miniaudio is missing: raw PCM piped into ffplay."""
+
+    def __init__(self):
+        ffplay = find_tool("ffplay")
+        if not ffplay:
+            raise RuntimeError("no audio output: run /read-aloud setup")
+        mute = ["-volume", "0"] if MUTED else []
+        self._proc = popen([ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet", *mute,
+                            "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ch_layout", "mono",
+                            "-i", "pipe:0"], stdin=subprocess.PIPE)
+        PID_FILE.write_text(str(self._proc.pid))
+        self.written = 0
+        self._started = None
+
+    def write(self, pcm):
+        if self._started is None:
+            self._started = time.time() + 0.25
+        # After an underrun the stream restarts from now.
+        heard = self.position()
+        if heard >= self.written:
+            self._started = time.time() + 0.25 - self.written / BYTES_PER_SEC
+        self._proc.stdin.write(pcm)
+        self._proc.stdin.flush()
+        self.written += len(pcm)
+
+    def position(self):
+        if self._started is None:
+            return 0
+        return max(0, min(self.written, int((time.time() - self._started) * BYTES_PER_SEC)))
+
+    def drain(self):
+        # ffplay quits at end of input, not end of sound: keep it fed with silence.
+        while self.position() < self.written and self._proc.poll() is None:
+            self._proc.stdin.write(b"\x00\x00" * (SAMPLE_RATE // 10))
+            self._proc.stdin.flush()
+            time.sleep(0.1)
+        time.sleep(0.4)
+
+    def close(self):
+        try:
+            self._proc.stdin.close()
+            self._proc.wait(timeout=1)
+        except Exception:
+            self._proc.kill()
 
 
 def stop_playing():
@@ -470,7 +665,7 @@ def stop_playing():
 
 
 def sequence_worker(job_file):
-    """Read paragraphs back to back through ONE player (no gaps); the next
+    """Read paragraphs back to back through ONE output stream; the next
     paragraph is made while the current one plays."""
     from concurrent.futures import ThreadPoolExecutor
     job = json.loads(Path(job_file).read_text(encoding="utf-8"))
@@ -479,6 +674,7 @@ def sequence_worker(job_file):
     SEQ_PID_FILE.write_text(str(os.getpid()))
     raw = job["items"]
     start = job.get("start", 0)
+    speed = get_speed()
     _, voice = block_items([it["text"] for it in raw])
     items = [(it["key"], clean(it["text"])) for it in raw[start:]]
     items = [(k, t) for k, t in items if t]
@@ -486,37 +682,38 @@ def sequence_worker(job_file):
         unlink(SEQ_PID_FILE)
         return
     pool = ThreadPoolExecutor(max_workers=1)
-    futures = [pool.submit(synth_to, t, voice, cache_path(t, voice)) for _, t in items]
-
-    speed = get_speed()
-    bytes_per_sec = SAMPLE_RATE * 2 * speed
+    futures = [pool.submit(synth_to, t, voice, speed, cache_path(t, voice, speed))
+               for _, t in items]
     try:
-        player = popen(ffplay_cmd(speed), priority=ABOVE_NORMAL, stdin=subprocess.PIPE)
+        player = MiniaudioPlayer() if has_module("miniaudio") else FfplayPlayer()
     except Exception as e:
-        log(f"cannot start player: {e!r}")
+        log(f"cannot open audio output: {e!r}")
         unlink(SEQ_PID_FILE)
         return
-    PID_FILE.write_text(str(player.pid))
 
-    # What is heard lags what is written, so NOW_FILE follows a schedule.
+    # NOW_FILE follows what is heard: each paragraph starts at a byte offset.
     schedule = []
     done = threading.Event()
 
     def follow():
         shown = None
         while not done.is_set():
-            now = time.time()
+            pos = player.position()
             current = None
-            for at, key in list(schedule):
-                if at <= now:
+            for offset, key in list(schedule):
+                if offset <= pos:
                     current = key
             if current and current != shown:
-                NOW_FILE.write_text(current, encoding="utf-8")
+                # Written aside and renamed, so a reader never sees it half-written.
+                tmp = NOW_FILE.with_suffix(".tmp")
+                tmp.write_text(current, encoding="utf-8")
+                try:
+                    tmp.replace(NOW_FILE)
+                except OSError:
+                    NOW_FILE.write_text(current, encoding="utf-8")
                 shown = current
             time.sleep(0.05)
 
-    t_begin = time.time()
-    end_at = [t_begin + PLAYER_LATENCY]
     follower = threading.Thread(target=follow, daemon=True)
     follower.start()
     try:
@@ -526,31 +723,17 @@ def sequence_worker(job_file):
             except Exception as e:
                 log(f"paragraph failed: {e!r}")
                 continue
-            starts = max(end_at[0], time.time() + PLAYER_LATENCY)
-            end_at[0] = starts + len(pcm) / bytes_per_sec
-            schedule.append((starts, key))
+            schedule.append((player.written, key))
             if DEBUG_FILE.exists():
-                log(f"sched {key} at +{starts - t_begin:.2f}s, "
-                    f"{len(pcm) / bytes_per_sec:.2f}s long @ {speed:g}x")
-            player.stdin.write(pcm + SILENCE_BETWEEN)
-            end_at[0] += len(SILENCE_BETWEEN) / bytes_per_sec
-            player.stdin.flush()
-        # ffplay quits at end of input, not end of sound: feed silence until
-        # everything written has been heard, then close.
-        while time.time() < end_at[0] + 0.6 and player.poll() is None:
-            player.stdin.write(b"\x00\x00" * (SAMPLE_RATE // 10))
-            player.stdin.flush()
-            time.sleep(0.1)
-        player.stdin.close()
-        try:
-            player.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            player.kill()
+                log(f"queued {key} at byte {player.written}, {len(pcm) / BYTES_PER_SEC:.2f}s")
+            player.write(pcm + SILENCE_BETWEEN)
+        player.drain()
     except (BrokenPipeError, OSError):
         pass  # stopped
     finally:
         done.set()
         follower.join(timeout=1)
+        player.close()
         pool.shutdown(wait=False, cancel_futures=True)
         unlink(NOW_FILE, PID_FILE, SEQ_PID_FILE)
 
@@ -581,20 +764,16 @@ def hook():
 
 def doctor():
     report = {"python": sys.executable, "platform": sys.platform}
-    for mod in ("piper", "edge_tts"):
-        try:
-            __import__(mod)
-            report[mod] = True
-        except Exception as e:
-            report[mod] = f"missing ({e.__class__.__name__})"
-    report["ffplay"] = find_tool("ffplay") or "missing"
-    report["ffmpeg"] = find_tool("ffmpeg") or "missing"
+    report.update({k: v for k, v in paths_report().items() if k in ("ready", "problem", "setup")})
+    report["private_venv"] = str(VENV_DIR) if VENV_READY.exists() else "not set up"
+    for mod in ("piper", "edge_tts", "miniaudio"):
+        report[mod] = has_module(mod)
+    report["ffplay_fallback"] = find_tool("ffplay") or "not found (not needed)"
     report["piper_server"] = "running" if _ping() else "not running (starts on first use)"
     report["voices_downloaded"] = sorted(p.stem for p in VOICE_DIR.glob("*.onnx"))
     report["voice"] = VOICE_FILE.read_text().strip() if VOICE_FILE.exists() else "auto"
     report["speed"] = get_speed()
     report["auto_read"] = AUTO_FILE.exists()
-    report["ok"] = report["piper"] is True and report["ffplay"] != "missing"
     return report
 
 
@@ -645,10 +824,24 @@ def main():
             else:
                 unlink(AUTO_FILE)
         print("on" if AUTO_FILE.exists() else "off")
+    elif cmd == "--setup":
+        state = start_setup()
+        print({"ready": "Read-aloud is already set up.",
+               "running": "Setup is already running (1-2 minutes).",
+               "started": "Setting up read-aloud (one time, 1-2 minutes)..."}[state])
+    elif cmd == "--setup-worker":
+        setup_worker()
+    elif cmd == "--warm":
+        # Session start: get the voice server loading now, so the first press
+        # does not wait for it. Returns at once.
+        if paths_report()["ready"] and not _ping():
+            spawn("--warm-worker")
+    elif cmd == "--warm-worker":
+        ensure_piper_server()
     elif cmd == "--doctor":
         print(json.dumps(doctor()))
     elif cmd == "--paths":
-        print(json.dumps({"now": str(NOW_FILE), "speed": str(SPEED_FILE)}))
+        print(json.dumps(paths_report()))
 
 
 if __name__ == "__main__":

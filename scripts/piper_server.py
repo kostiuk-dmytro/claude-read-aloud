@@ -20,7 +20,7 @@ PORT = int(os.environ.get("CLAUDE_READ_ALOUD_PORT", "59125"))
 VOICE_DIR = Path.home() / ".claude" / "read-aloud" / "piper-voices"
 IDLE_EXIT = 4 * 3600
 ORT_THREADS = 4
-PRELOAD = "en_US-lessac-medium"
+LAST_VOICE = VOICE_DIR.parent / "last_voice.txt"  # loaded at start, ready for the next press
 # Piper voice names: <lang>_<REGION>-<name>-<quality>, nothing that is a path.
 VOICE_NAME = re.compile(r"^[a-z]{2,3}_[A-Z]{2}-[A-Za-z0-9_]+-(x_low|low|medium|high)$")
 MAX_TEXT = 5000
@@ -63,6 +63,10 @@ def get_voice(name):
                 download_voice(name, VOICE_DIR)
             _voices[name] = PiperVoice.load(str(model))
             _locks[name] = threading.Lock()
+            try:
+                LAST_VOICE.write_text(name, encoding="utf-8")
+            except Exception:
+                pass
     return _voices[name], _locks[name]
 
 
@@ -87,10 +91,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(413, b"too large", "text/plain")
             body = json.loads(self.rfile.read(length))
             text = str(body["text"])[:MAX_TEXT]
+            speed = min(2.0, max(0.5, float(body.get("speed", 1.0))))
             voice, lock = get_voice(str(body["voice"]))
+            from piper import SynthesisConfig
+            # Speed is set in the voice itself (phoneme length), so pitch stays.
+            config = SynthesisConfig(length_scale=voice.config.length_scale / speed)
             buf = io.BytesIO()
             with lock, wave.open(buf, "wb") as w:  # espeak phonemizer is not thread-safe
-                voice.synthesize_wav(text, w)
+                voice.synthesize_wav(text, w, syn_config=config)
             self._send(200, buf.getvalue(), "audio/wav")
         except Exception as e:
             self._send(500, repr(e).encode(), "text/plain")
@@ -130,9 +138,11 @@ def main():
 
     def preload():
         try:
-            get_voice(PRELOAD)
+            name = LAST_VOICE.read_text(encoding="utf-8").strip()
+            if (VOICE_DIR / f"{name}.onnx").exists():
+                get_voice(name)
         except Exception:
-            pass
+            pass  # no voice used yet: the first request loads its own
 
     threading.Thread(target=preload, daemon=True).start()
     server.serve_forever()
