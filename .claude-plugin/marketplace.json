@@ -1,0 +1,12 @@
+{
+  "name": "claude-read-aloud",
+  "description": "claude-read-aloud: text-to-speech (read aloud) for Claude Code replies.",
+  "owner": { "name": "Dmytro Kostiuk" },
+  "plugins": [
+    {
+      "name": "claude-read-aloud",
+      "source": "./",
+      "description": "Text-to-speech for Claude Code: read Claude's replies aloud, paragraph by paragraph."
+    }
+  ]
+}

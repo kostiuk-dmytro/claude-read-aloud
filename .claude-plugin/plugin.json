@@ -1,0 +1,11 @@
+{
+  "name": "claude-read-aloud",
+  "version": "1.0.0",
+  "description": "Text-to-speech for Claude Code: a read-aloud button beside every paragraph of Claude's replies, with fast local Piper voices, gapless playback and a speed control.",
+  "author": { "name": "Dmytro Kostiuk", "url": "https://github.com/kostiuk-dmytro" },
+  "homepage": "https://github.com/kostiuk-dmytro/claude-read-aloud",
+  "repository": "https://github.com/kostiuk-dmytro/claude-read-aloud",
+  "license": "MIT",
+  "keywords": ["text-to-speech", "tts", "read aloud", "voice", "accessibility", "piper", "speech", "audio"],
+  "types": "./types/index.d.ts"
+}
